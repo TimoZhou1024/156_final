@@ -1,1 +1,4 @@
 .claude/
+test_files/
+*.html
+*.log
