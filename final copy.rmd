@@ -1,0 +1,1207 @@
+---
+title: "Replication Study: The Causal Effects of Racial Segregation on Urban Poverty and Inequality"
+author: "Ivan Chen and Siyuan Zhou"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    number_sections: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+\newpage
+
+# Data and Empirical Strategy
+
+## Data
+
+### Setup and Data Loading
+
+```{r libraries}
+# Load required libraries
+library(dplyr)          # Data manipulation
+library(tidyr)          # Data reshaping (pivot functions)
+library(haven)          # Read Stata files
+library(stargazer)      # Regression tables
+library(lfe)            # Linear fixed effects models
+library(AER)            # Instrumental variables regression
+library(ggplot2)        # Visualization
+library(kableExtra)     # Enhanced tables
+library(sandwich)       # Robust standard errors
+library(lmtest)         # Hypothesis testing
+```
+
+```{r load_data}
+# Load the main dataset
+# Note: Update the path to match your data location
+aej_data <- read_dta('D:\\156_final\\reference\\Research-Reproduction_Causal-Effect-of-Segregation-on-Poverty-Rates\\Data\\aej.dta')
+
+# Display dataset dimensions
+cat("Dataset dimensions:", nrow(aej_data), "observations,", ncol(aej_data), "variables\n")
+```
+
+## Variable Selection and Description
+
+```{r select_variables}
+# Select key variables for analysis
+df <- aej_data %>%
+  select(
+    # Main variables
+    dism1990,      # 1990 dissimilarity index (segregation measure)
+    herf,          # Railroad Division Index (RDI) - instrument
+    lenper,        # Track length per square km - control
+
+    # Outcome variables: Poverty rates
+    povrate_w,     # White poverty rate 1990
+    povrate_b,     # Black poverty rate 1990
+
+    # Outcome variables: Within-race inequality (Gini coefficients)
+    lngini_w,      # Log Gini coefficient for whites
+    lngini_b,      # Log Gini coefficient for blacks
+
+    # Outcome variables: Between-race inequality
+    ln90w90b,      # Log ratio 90th percentile white to 90th percentile black
+    ln10w10b,      # Log ratio 10th percentile white to 10th percentile black
+    ln90w10b,      # Log ratio 90th percentile white to 10th percentile black
+    ln90b10w,      # Log ratio 90th percentile black to 10th percentile white
+
+    # Historical city characteristics (1910)
+    area1910,      # Physical area in 1910 (1000 sq. miles)
+    count1910,     # Population in 1910 (1000s)
+    ethseg10,      # Ethnic dissimilarity index in 1910
+    ethiso10,      # Ethnic isolation index in 1910
+    black1910,     # Percent Black in 1910
+
+    # Historical characteristics (1920)
+    passpc,        # Street cars per capita 1915
+    black1920,     # Percent Black 1920
+    lfp1920,       # Labor force participation 1920
+
+    # Contemporary characteristics (1990)
+    incseg,        # Income segregation 1990
+    pctbk1990,     # Percent Black 1990
+    manshr,        # Share employed in manufacturing 1990
+    pop1990,       # Population in 1990
+
+    # City name (if available)
+    name
+  )
+
+# Convert to numeric where necessary
+df <- df %>%
+  mutate(across(c(dism1990, herf, lenper, povrate_w, povrate_b,
+                  lngini_w, lngini_b, ln90w90b, ln10w10b, ln90w10b, ln90b10w),
+                as.numeric))
+
+cat("Final dataset:", nrow(df), "cities\n")
+```
+
+## Data Cleaning
+
+Before proceeding with the analysis, we conduct a systematic data cleaning process to ensure data quality and transparency in sample selection.
+
+### Missing Values Analysis
+
+```{r missing_values}
+# Function to calculate missing value statistics
+missing_summary <- function(data) {
+  data.frame(
+    Variable = names(data),
+    Missing_Count = sapply(data, function(x) sum(is.na(x))),
+    Missing_Percent = sapply(data, function(x) round(100 * sum(is.na(x)) / length(x), 2)),
+    Non_Missing = sapply(data, function(x) sum(!is.na(x)))
+  ) %>%
+    filter(Missing_Count > 0) %>%
+    arrange(desc(Missing_Percent))
+}
+
+# Display missing value summary
+missing_stats <- missing_summary(df)
+
+if(nrow(missing_stats) > 0) {
+  kable(missing_stats,
+        caption = "Missing Values Summary",
+        col.names = c("Variable", "Missing Count", "Missing %", "Non-Missing Count"),
+        row.names = FALSE) %>%
+    kable_styling(latex_options = c("striped", "hold_position"))
+} else {
+  cat("No missing values detected in the dataset.\n")
+}
+
+cat("\nInitial sample size:", nrow(df), "cities\n")
+```
+
+### Descriptive Statistics for Key Variables
+
+```{r data_quality_check}
+# Check distributions of key variables
+key_vars <- c("dism1990", "herf", "lenper", "povrate_w", "povrate_b")
+
+# Calculate descriptive statistics
+desc_stats <- df %>%
+  select(all_of(key_vars)) %>%
+  summarise(across(everything(),
+                   list(
+                     Min = ~min(., na.rm = TRUE),
+                     Q1 = ~quantile(., 0.25, na.rm = TRUE),
+                     Median = ~median(., na.rm = TRUE),
+                     Mean = ~mean(., na.rm = TRUE),
+                     Q3 = ~quantile(., 0.75, na.rm = TRUE),
+                     Max = ~max(., na.rm = TRUE),
+                     SD = ~sd(., na.rm = TRUE)
+                   ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Variable", "Statistic"),
+               names_pattern = "(.*)_(.*)") %>%
+  pivot_wider(names_from = Statistic, values_from = value)
+
+# Display descriptive statistics
+kable(desc_stats,
+      digits = 3,
+      caption = "Descriptive Statistics for Key Variables") %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"))
+```
+
+### Outlier Detection
+
+```{r outlier_detection}
+# Function to identify potential outliers using IQR method
+identify_outliers <- function(x, multiplier = 3) {
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - multiplier * iqr
+  upper_bound <- q3 + multiplier * iqr
+
+  outliers <- x < lower_bound | x > upper_bound
+  return(sum(outliers, na.rm = TRUE))
+}
+
+# Check for outliers in key variables
+outlier_summary <- data.frame(
+  Variable = key_vars,
+  Outlier_Count = sapply(df[key_vars], identify_outliers),
+  Percent = sapply(df[key_vars], function(x) {
+    round(100 * identify_outliers(x) / sum(!is.na(x)), 2)
+  })
+)
+
+kable(outlier_summary,
+      caption = "Outlier Detection (using 3*IQR method)",
+      col.names = c("Variable", "Outlier Count", "Percent of Sample")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+
+cat("\nNote: Outliers are defined as values beyond Q1 - 3*IQR or Q3 + 3*IQR.\n")
+cat("These are flagged for awareness but not automatically removed, as extreme values\n")
+cat("may represent genuine city characteristics rather than measurement errors.\n")
+```
+
+### Data Validation
+
+```{r data_validation}
+# Check if percentage variables are within valid ranges
+validation_checks <- list(
+  "Poverty rates in [0,100]" = all(df$povrate_w >= 0 & df$povrate_w <= 100, na.rm = TRUE) &
+                                all(df$povrate_b >= 0 & df$povrate_b <= 100, na.rm = TRUE),
+  "Dissimilarity index in [0,1]" = all(df$dism1990 >= 0 & df$dism1990 <= 1, na.rm = TRUE),
+  "RDI (herf) in [0,1]" = all(df$herf >= 0 & df$herf <= 1, na.rm = TRUE),
+  "Track length non-negative" = all(df$lenper >= 0, na.rm = TRUE)
+)
+
+validation_df <- data.frame(
+  Check = names(validation_checks),
+  Status = ifelse(unlist(validation_checks), "Pass", "Fail")
+)
+
+kable(validation_df,
+      caption = "Data Validation Checks",
+      col.names = c("Validation Check", "Status")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+### Final Sample Selection
+
+```{r final_sample}
+# For the main analysis, we keep all observations with non-missing values
+# for the core variables (instrument, treatment, and outcomes)
+# This follows the approach in the original paper
+
+df_clean <- df %>%
+  filter(!is.na(dism1990), !is.na(herf), !is.na(lenper),
+         !is.na(povrate_w), !is.na(povrate_b),
+         !is.na(lngini_w), !is.na(lngini_b))
+
+cat("Sample after removing observations with missing core variables:\n")
+cat("  Observations removed:", nrow(df) - nrow(df_clean), "\n")
+cat("  Final sample size:", nrow(df_clean), "cities\n")
+cat("  Retention rate:", round(100 * nrow(df_clean) / nrow(df), 1), "%\n")
+
+# Update main dataframe for subsequent analysis
+df <- df_clean
+```
+
+## Summary Statistics
+
+### Table A Replication: Balance Test
+
+Following Ananat (2011) Table A, we examine whether cities in our analysis sample differ systematically from those excluded due to missing data. This balance test helps assess whether sample selection introduces bias. The goal is to demonstrate that cities with available data are not systematically different from those without, which strengthens the external validity of the findings.
+
+```{r load_table_A1_data}
+# Load the Table A1 dataset which contains the sample indicator
+library(broom)
+table_A1_data <- read_dta('d:/156_final/data/table_A1.dta')
+
+# Display dataset dimensions
+cat("Table A1 dataset dimensions:", nrow(table_A1_data), "observations,",
+    ncol(table_A1_data), "variables\n")
+```
+
+```{r calculate_summary_tableA, results='asis'}
+# Define the sample indicator variable
+sample_col <- "sample"  # Binary column: 1 = In Sample, 0 = Not In Sample
+
+# Identify all numeric variables except the sample indicator
+numeric_vars <- names(table_A1_data)[sapply(table_A1_data, is.numeric) &
+                                      names(table_A1_data) != sample_col]
+
+# Function to calculate summary statistics and t-tests
+calculate_summary <- function(data, variable, sample_col) {
+  # Calculate group statistics
+  group_stats <- data %>%
+    group_by(!!sym(sample_col)) %>%
+    summarize(
+      mean = mean(!!sym(variable), na.rm = TRUE),
+      se = sd(!!sym(variable), na.rm = TRUE) / sqrt(n()),
+      sd = sd(!!sym(variable), na.rm = TRUE),
+      .groups = 'drop'
+    )
+
+  # Check if standard deviation is non-zero for both groups
+  if (any(group_stats$sd == 0 | is.na(group_stats$sd))) {
+    return(tibble(
+      Variable = variable,
+      `Mean (In Sample)` = NA,
+      `SE (In Sample)` = NA,
+      `Mean (Not In Sample)` = NA,
+      `SE (Not In Sample)` = NA,
+      `Difference in Means` = NA,
+      `P-value` = NA
+    ))
+  }
+
+  # Calculate t-test for difference in means
+  t_test <- t.test(
+    data[[variable]][data[[sample_col]] == 1],
+    data[[variable]][data[[sample_col]] == 0]
+  )
+
+  # Output desired table
+  tibble(
+    Variable = variable,
+    `Mean (In Sample)` = group_stats$mean[group_stats[[sample_col]] == 1],
+    `SE (In Sample)` = group_stats$se[group_stats[[sample_col]] == 1],
+    `Mean (Not In Sample)` = group_stats$mean[group_stats[[sample_col]] == 0],
+    `SE (Not In Sample)` = group_stats$se[group_stats[[sample_col]] == 0],
+    `Difference in Means` = t_test$estimate[1] - t_test$estimate[2],
+    `P-value` = t_test$p.value
+  )
+}
+
+# Calculate summary statistics for all numeric variables
+summary_table_full <- purrr::map_dfr(numeric_vars,
+                                      ~calculate_summary(table_A1_data, .x, sample_col))
+
+# Define the key variables to include in Table A (following the paper)
+key_columns <- c(
+  "area1900", "area1940", "area1970", "area1990",
+  "isol1890", "isol1940t", "isol1940w", "isol1970", "isol1990",
+  "dism1890", "dism1940t", "dism1940w", "dism1970", "dism1990",
+  "pctbk1890", "pctbk1940", "pctbk1970", "pctbk1990",
+  "pop1890", "pop1940", "pop1970", "pop1990",
+  "ward1890", "ward1940", "tract1940", "tract1970", "tract1990",
+  "passpc", "bsvtsh", "revig62", "ngov62", "medinc", "incseg",
+  "bincseg", "meduc", "singmom", "ttwork", "educex", "gum",
+  "cluster", "concent", "central", "pwdens"
+)
+
+# Filter for key variables
+table_A1 <- summary_table_full %>%
+  filter(Variable %in% key_columns) %>%
+  arrange(Variable)
+
+# Create formatted table with separate columns for mean and SE
+table_A1_formatted <- table_A1 %>%
+  mutate(
+    `In Sample Mean` = sprintf("%.3f", `Mean (In Sample)`),
+    `In Sample SE` = sprintf("(%.3f)", `SE (In Sample)`),
+    `Not In Sample Mean` = sprintf("%.3f", `Mean (Not In Sample)`),
+    `Not In Sample SE` = sprintf("(%.3f)", `SE (Not In Sample)`),
+    `Difference` = sprintf("%.3f", `Difference in Means`),
+    `P-value` = sprintf("%.3f", `P-value`),
+    # Add significance stars
+    Sig = case_when(
+      `P-value` < 0.01 ~ "***",
+      `P-value` < 0.05 ~ "**",
+      `P-value` < 0.10 ~ "*",
+      TRUE ~ ""
+    )
+  ) %>%
+  select(Variable, `In Sample Mean`, `In Sample SE`,
+         `Not In Sample Mean`, `Not In Sample SE`,
+         `Difference`, `P-value`, Sig)
+
+# Display the table
+kable(table_A1_formatted,
+      caption = "Table A: Mean Characteristics of Cities In and Out of Sample",
+      align = c("l", "r", "r", "r", "r", "r", "r", "c"),
+      escape = FALSE) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"),
+                font_size = 7) %>%
+  add_header_above(c(" " = 1, "In Sample" = 2, "Not In Sample" = 2, " " = 3)) %>%
+  column_spec(1, width = "3.5cm") %>%
+  column_spec(2:5, width = "1.3cm") %>%
+  column_spec(6:7, width = "1.2cm") %>%
+  column_spec(8, width = "0.8cm") %>%
+  footnote(general = c(
+    "Standard errors in parentheses.",
+    "*** p<0.01, ** p<0.05, * p<0.10",
+    "This table replicates Ananat (2011) Table A.",
+    "T-tests compare means between cities in the analysis sample vs. excluded cities."
+  ), threeparttable = TRUE)
+```
+
+**Interpretation of Table A:**
+
+The balance test reveals important insights about sample selection:
+
+1. **Most Variables Are Balanced**: The majority of variables show **non-significant differences** (p > 0.05) between cities in and out of the sample, suggesting that the analysis sample is representative.
+
+2. **Some Significant Differences**: A few variables (e.g., percent Black 1940, concentration index 1990) show statistically significant differences. However, the **magnitude of these differences is small** (typically < 0.1), indicating that any bias from sample selection is likely minimal.
+
+3. **External Validity**: The overall balance across historical, demographic, and economic characteristics strengthens confidence that the causal estimates from the analysis sample can generalize to other U.S. cities.
+
+4. **Covariate Balance**: The balance in key covariates like historical segregation measures, population, and economic indicators suggests that excluded cities are not systematically different in ways that would confound the analysis.
+
+### Summary Statistics for Main Analysis Variables
+
+```{r main_vars_summary}
+# Calculate summary statistics for key variables in our analysis dataset
+main_vars <- c("dism1990", "herf", "lenper", "povrate_w", "povrate_b",
+               "lngini_w", "lngini_b", "pctbk1990", "pop1990")
+
+summary_main <- df %>%
+  select(all_of(main_vars)) %>%
+  summarise(across(everything(),
+                   list(
+                     N = ~sum(!is.na(.)),
+                     Mean = ~mean(., na.rm = TRUE),
+                     SD = ~sd(., na.rm = TRUE),
+                     Min = ~min(., na.rm = TRUE),
+                     Median = ~median(., na.rm = TRUE),
+                     Max = ~max(., na.rm = TRUE)
+                   ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Variable", "Statistic"),
+               names_pattern = "(.*)_(.*)") %>%
+  pivot_wider(names_from = Statistic, values_from = value)
+
+# Add variable labels
+var_labels <- c(
+  "dism1990" = "Dissimilarity Index 1990",
+  "herf" = "Railroad Division Index (RDI)",
+  "lenper" = "Track Length per sq km",
+  "povrate_w" = "White Poverty Rate (%)",
+  "povrate_b" = "Black Poverty Rate (%)",
+  "lngini_w" = "Log Gini Coefficient (White)",
+  "lngini_b" = "Log Gini Coefficient (Black)",
+  "pctbk1990" = "Percent Black 1990",
+  "pop1990" = "Population 1990"
+)
+
+summary_main <- summary_main %>%
+  mutate(Variable = var_labels[Variable])
+
+kable(summary_main,
+      digits = 2,
+      caption = "Summary Statistics for Main Analysis Variables",
+      col.names = c("Variable", "N", "Mean", "SD", "Min", "Median", "Max")) %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+**Key Insights:**
+
+1. **Substantial Segregation**: The average dissimilarity index is `r round(mean(df$dism1990, na.rm=TRUE), 3)`, indicating substantial residential segregation in U.S. cities. This measure ranges from 0 (complete integration) to 1 (complete segregation).
+
+2. **Racial Poverty Gap**: Black poverty rates (`r round(mean(df$povrate_b, na.rm=TRUE), 1)`%) are approximately `r round(mean(df$povrate_b, na.rm=TRUE) - mean(df$povrate_w, na.rm=TRUE), 1)` percentage points higher than white poverty rates (`r round(mean(df$povrate_w, na.rm=TRUE), 1)`%).
+
+3. **Within-Race Inequality**: The log Gini coefficients reveal income inequality within each racial group. The average log Gini for whites is `r round(mean(df$lngini_w, na.rm=TRUE), 3)` compared to `r round(mean(df$lngini_b, na.rm=TRUE), 3)` for blacks, suggesting different patterns of within-race inequality.
+
+4. **Instrument Variation**: The Railroad Division Index shows meaningful variation (SD = `r round(sd(df$herf, na.rm=TRUE), 3)`), providing sufficient identifying variation for instrumental variables estimation.
+
+5. **Sample Characteristics**: The analysis includes `r nrow(df)` cities with complete data on key variables, representing a substantial cross-section of U.S. metropolitan areas.
+
+## Ideal and Empirical Approach
+
+### The Endogeneity Problem
+
+We begin by examining the simple correlation between segregation and poverty rates using ordinary least squares (OLS) regression:
+
+$$\text{PovertyRate}_i = \beta_0 + \beta_1 \text{Segregation}_i + \epsilon_i$$
+
+However, we cannot interpret these as causal effects due to several potential confounding factors:
+
+1. **City Size and Infrastructure**: Larger cities may have both more segregation (due to more complex infrastructure) and different poverty patterns due to labor market dynamics, cost of living, and available public services.
+
+2. **Historical Discrimination and Policy**: Cities with stronger historical discrimination may have both higher segregation and policies that differentially affect economic opportunities by race (redlining, discriminatory lending, school quality, etc.).
+
+3. **Economic Structure**: Cities with different industrial compositions (manufacturing vs. service economy) may have different segregation patterns and different poverty rates based on skill demands and wage structures.
+
+4. **Education Systems**: The quality and segregation of school systems could be both a cause and consequence of residential segregation, while independently affecting economic outcomes.
+
+5. **Migration Patterns**: People self-select into cities based on economic opportunities and preferences. Selective migration could create spurious correlations between segregation and outcomes.
+
+6. **Unobserved City Characteristics**: Cultural attitudes, political preferences, historical shocks, and other unobservable factors could simultaneously affect both segregation levels and economic outcomes.
+
+These concerns motivate the use of an instrumental variables approach to isolate exogenous variation in segregation.
+
+### Instrumental Variables Approach: The Railroad Division Index
+
+For the Railroad Division Index (RDI) to be a valid instrument, it must satisfy two conditions:
+
+**Condition 1: Relevance (Strong First Stage)**
+
+The instrument must be strongly correlated with the endogenous variable (segregation). We test this with the first-stage regression:
+
+$$\text{Segregation}_i = \alpha_0 + \alpha_1 \text{RDI}_i + \alpha_2 \text{TrackLength}_i + \mu_i$$
+
+**Condition 2: Exclusion Restriction**
+
+The instrument must affect outcomes **only through** segregation, not through other channels. We test this by examining whether the RDI predicts pre-existing city characteristics that could independently affect poverty and inequality.
+
+## Instrument Validation
+
+### Naive OLS Estimates
+
+Before implementing the instrumental variables approach, we first examine the simple correlation between segregation and poverty rates:
+
+```{r ols_regressions, results='asis'}
+# OLS regressions of poverty rates on segregation
+model_povrate_w_ols <- felm(povrate_w ~ dism1990, data = df)
+model_povrate_b_ols <- felm(povrate_b ~ dism1990, data = df)
+
+# Generate regression table
+stargazer(model_povrate_w_ols, model_povrate_b_ols,
+          se = list(model_povrate_w_ols$rse, model_povrate_b_ols$rse),
+          type = "latex",
+          title = "OLS: Effect of Segregation on Poverty Rates",
+          dep.var.labels = c("White Poverty Rate", "Black Poverty Rate"),
+          covariate.labels = c("Dissimilarity Index"),
+          header = FALSE,
+          omit.stat = c("f", "ser", "adj.rsq"),
+          digits = 3,
+          notes = "Robust standard errors in parentheses")
+```
+
+**Interpretation:**
+
+The OLS results show that a one standard deviation increase in segregation (dissimilarity index) is associated with:
+
+- A **decrease** of approximately `r abs(round(coef(model_povrate_w_ols)["dism1990"], 2))`% in white poverty rates (statistically significant)
+- An **increase** of approximately `r round(coef(model_povrate_b_ols)["dism1990"], 2)`% in Black poverty rates (statistically significant)
+
+These correlations suggest that more segregated cities have larger racial disparities in poverty. However, we cannot interpret these as causal effects due to the endogeneity concerns outlined above.
+
+\newpage
+
+### First Stage: Validity of the Instrument
+
+```{r first_stage, results='asis'}
+# First-stage regression
+first_stage <- felm(dism1990 ~ herf + lenper, data = df)
+
+# Calculate F-statistic
+first_stage_summary <- summary(first_stage, robust = TRUE)
+f_stat <- first_stage_summary$F.fstat[1]
+
+# Display results
+stargazer(first_stage,
+          se = list(first_stage$rse),
+          type = "latex",
+          title = "First Stage: Effect of Railroad Configuration on Segregation",
+          dep.var.labels = "Dissimilarity Index (1990)",
+          covariate.labels = c("Railroad Division Index", "Track Length per sq km"),
+          header = FALSE,
+          add.lines = list(c("F-statistic (RDI)", round(f_stat, 2))),
+          digits = 3,
+          notes = "Robust standard errors in parentheses")
+```
+
+**Results:**
+
+The first-stage F-statistic is `r round(f_stat, 2)`, which **far exceeds** the conventional threshold of 10 for a strong instrument. This indicates that the RDI is a strong predictor of segregation, satisfying the relevance condition.
+
+A one standard deviation increase in the Railroad Division Index is associated with a `r round(coef(first_stage)["herf"], 3)` increase in the dissimilarity index, holding track length constant.
+
+### Visual Relationship: RDI and Segregation
+
+```{r first_stage_plot}
+# Create scatter plot with regression line
+ggplot(df, aes(x = herf, y = dism1990)) +
+  geom_point(color = 'cornflowerblue', size = 2.5, alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, color = "firebrick", linewidth = 1) +
+  labs(
+    title = "Relationship Between Railroad Division Index and Segregation",
+    subtitle = paste0("First Stage Regression (F-stat = ", round(f_stat, 2), ")"),
+    x = "Railroad Division Index",
+    y = "Dissimilarity Index (1990)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 11)
+  )
+```
+
+The strong positive relationship confirms that cities where railroad tracks created more divisions tend to have higher levels of residential segregation in 1990.
+
+### Testing the Exclusion Restriction
+
+```{r exclusion_tests, results='asis'}
+# Test if RDI predicts pre-existing city characteristics
+excl_area <- felm(area1910 ~ herf + lenper, data = df)
+excl_pop <- felm(count1910 ~ herf + lenper, data = df)
+excl_black1910 <- felm(black1910 ~ herf + lenper, data = df)
+excl_lfp <- felm(lfp1920 ~ herf + lenper, data = df)
+excl_incseg <- felm(incseg ~ herf + lenper, data = df)
+
+# Generate table
+stargazer(excl_area, excl_pop, excl_black1910, excl_lfp, excl_incseg,
+          se = list(excl_area$rse, excl_pop$rse, excl_black1910$rse,
+                    excl_lfp$rse, excl_incseg$rse),
+          type = "latex",
+          title = "Testing Exclusion Restriction: RDI and Pre-existing City Characteristics",
+          dep.var.labels = c("Area 1910", "Pop 1910", "\\% Black 1910",
+                            "LFP 1920", "Income Seg"),
+          covariate.labels = c("Railroad Division Index", "Track Length per sq km"),
+          header = FALSE,
+          omit.stat = c("f", "ser"),
+          column.sep.width = "1pt",
+          font.size = "small",
+          digits = 3,
+          notes = "Robust standard errors in parentheses")
+```
+
+**Interpretation:**
+
+The exclusion restriction requires that the RDI does not systematically predict city characteristics that could independently affect poverty and inequality. The results show that the RDI coefficient is **not statistically significant** for most pre-existing characteristics, supporting the validity of the exclusion restriction.
+
+This suggests that railroad configurations were largely independent of factors that would later affect economic outcomes, making it a plausible source of exogenous variation in segregation.
+
+### Assessment of Instrument Validity
+
+**Is the RDI a valid instrument?**
+
+Based on the evidence:
+
+1. **Relevance**: The F-statistic of `r round(f_stat, 2)` >> 10 confirms a strong first stage
+2. **Exclusion Restriction**: The RDI does not systematically predict pre-existing confounders
+3. **Exogeneity**: Railroad tracks were laid before most urbanization, and their configuration was determined by geographic and transportation factors, not future racial composition
+
+**Conclusion**: The evidence strongly supports the validity of the Railroad Division Index as an instrument for racial segregation. This allows us to interpret the two-stage least squares estimates as causal effects.
+
+\newpage
+
+# Replication and Robustness Check
+
+## Main Results
+
+### Two-Stage Least Squares (2SLS) Estimation
+
+We now estimate the causal effect of segregation on poverty rates using instrumental variables regression:
+
+**First Stage:**
+$$\text{Segregation}_i = \alpha_0 + \alpha_1 \text{RDI}_i + \alpha_2 \text{TrackLength}_i + \mu_i$$
+
+**Second Stage:**
+$$\text{PovertyRate}_i = \beta_0 + \beta_1 \widehat{\text{Segregation}}_i + \beta_2 \text{TrackLength}_i + \epsilon_i$$
+
+```{r iv_main_results, results='asis'}
+# OLS models (for comparison)
+ols_w <- felm(povrate_w ~ dism1990, data = df)
+ols_b <- felm(povrate_b ~ dism1990, data = df)
+
+# IV/2SLS models using AER::ivreg for better compatibility
+iv_w <- ivreg(povrate_w ~ dism1990 + lenper | herf + lenper, data = df)
+iv_b <- ivreg(povrate_b ~ dism1990 + lenper | herf + lenper, data = df)
+
+# Calculate robust standard errors for IV models
+iv_w_rse <- sqrt(diag(vcovHC(iv_w, type = "HC1")))
+iv_b_rse <- sqrt(diag(vcovHC(iv_b, type = "HC1")))
+
+# Generate comparison table
+stargazer(ols_w, ols_b, iv_w, iv_b,
+          se = list(ols_w$rse, ols_b$rse, iv_w_rse, iv_b_rse),
+          type = "latex",
+          title = "Main Results: Effect of Segregation on Poverty Rates",
+          column.labels = c("OLS", "OLS", "2SLS", "2SLS"),
+          dep.var.labels = c("White Poverty", "Black Poverty", "White Poverty", "Black Poverty"),
+          covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
+          header = FALSE,
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "2SLS models instrument segregation with Railroad Division Index."))
+```
+
+### Interpretation of Main Results
+
+#### White Poverty Rate
+
+The 2SLS estimate indicates that exogenous increases in segregation **decrease** white poverty rates. This is evident from the negative and statistically significant coefficient in the IV regression. This suggests that segregation creates economic advantages for the white population, possibly through:
+
+- Concentration of resources and services in predominantly white neighborhoods
+- Better access to job networks and opportunities
+- Higher quality schools and public goods in less diverse areas
+
+#### Black Poverty Rate
+
+The 2SLS estimate indicates that exogenous increases in segregation **increase** Black poverty rates. This is evident from the positive and statistically significant coefficient in the IV regression. This demonstrates that segregation imposes substantial economic costs on the Black population, likely through:
+
+- Isolation from job opportunities and economic networks
+- Concentration of poverty in segregated neighborhoods
+- Reduced access to quality education and services
+- Lower property values and wealth accumulation
+
+#### Comparison: OLS vs. 2SLS
+
+The 2SLS estimates are **larger in magnitude** than the OLS estimates. This suggests that:
+
+1. **Attenuation bias**: OLS estimates may be attenuated due to measurement error in segregation
+2. **Heterogeneous treatment effects**: The local average treatment effect (LATE) identified by the IV approach may differ from the average treatment effect
+3. **Confounding patterns**: Some confounders may have actually masked the true causal effects
+
+The larger causal estimates reinforce that segregation has **substantial and asymmetric effects** on poverty across racial groups.
+
+### Reduced Form: Direct Effect of Railroad Configuration
+
+An alternative way to visualize the causal effect is through the reduced form, which estimates the direct effect of the instrument on outcomes:
+
+$$\text{PovertyRate}_i = \gamma_0 + \gamma_1 \text{RDI}_i + \gamma_2 \text{TrackLength}_i + \nu_i$$
+
+```{r reduced_form, results='asis'}
+# Reduced form regressions
+rf_w <- felm(povrate_w ~ herf + lenper, data = df)
+rf_b <- felm(povrate_b ~ herf + lenper, data = df)
+
+stargazer(rf_w, rf_b,
+          se = list(rf_w$rse, rf_b$rse),
+          type = "latex",
+          title = "Reduced Form: Direct Effect of Railroad Configuration on Poverty",
+          dep.var.labels = c("White Poverty Rate", "Black Poverty Rate"),
+          covariate.labels = c("Railroad Division Index", "Track Length per sq km"),
+          header = FALSE,
+          digits = 3)
+```
+
+### Visual Representation of Reduced Form
+
+```{r reduced_form_plot, fig.height=6}
+# Create plot showing reduced form relationships
+ggplot(df, aes(x = herf)) +
+  # White poverty
+  geom_point(aes(y = povrate_w, color = "White Poverty Rate"), alpha = 0.5, size = 2) +
+  geom_abline(slope = coef(rf_w)["herf"],
+              intercept = coef(rf_w)["(Intercept)"],
+              color = "cornflowerblue", linewidth = 1.2) +
+  # Black poverty
+  geom_point(aes(y = povrate_b, color = "Black Poverty Rate"), alpha = 0.5, size = 2) +
+  geom_abline(slope = coef(rf_b)["herf"],
+              intercept = coef(rf_b)["(Intercept)"],
+              color = "firebrick", linewidth = 1.2) +
+  scale_color_manual(values = c("White Poverty Rate" = "cornflowerblue",
+                                "Black Poverty Rate" = "firebrick")) +
+  labs(
+    title = "Reduced Form: Railroad Configuration and Poverty Rates",
+    subtitle = "Direct effect of railroad-induced divisions on poverty",
+    x = "Railroad Division Index",
+    y = "Poverty Rate",
+    color = "Outcome"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+```
+
+**Note:** The 2SLS estimator can be calculated as the ratio of reduced form to first stage:
+
+$$\hat{\beta}_{2SLS} = \frac{\hat{\gamma}_1}{\hat{\alpha}_1}$$
+
+```{r wald_estimator}
+# Calculate Wald estimator
+wald_w <- coef(rf_w)["herf"] / coef(first_stage)["herf"]
+wald_b <- coef(rf_b)["herf"] / coef(first_stage)["herf"]
+
+cat("Wald estimator (White poverty):", round(wald_w, 3), "\n")
+cat("2SLS estimate (White poverty):", round(coef(iv_w)["dism1990"], 3), "\n\n")
+
+cat("Wald estimator (Black poverty):", round(wald_b, 3), "\n")
+cat("2SLS estimate (Black poverty):", round(coef(iv_b)["dism1990"], 3), "\n")
+```
+
+The Wald estimator matches the 2SLS estimate, confirming our calculations.
+
+\newpage
+
+### Effects on Within-Race Inequality (Gini Coefficients)
+
+Beyond poverty rates, we examine how segregation affects **within-race income inequality** using Gini coefficients. This analysis is crucial because segregation may not only shift mean outcomes but also affect the distribution of income within each racial group.
+
+**Research Question:** Does segregation homogenize or diversify economic outcomes within racial groups?
+
+**Measurement:** We use log Gini coefficients for whites (`lngini_w`) and blacks (`lngini_b`) as measures of income inequality within each racial group. Higher values indicate greater within-group inequality.
+
+```{r within_race_inequality, results='asis'}
+# OLS models for Gini coefficients (for comparison)
+ols_gini_w <- felm(lngini_w ~ dism1990, data = df)
+ols_gini_b <- felm(lngini_b ~ dism1990, data = df)
+
+# IV/2SLS models for Gini coefficients
+iv_gini_w <- ivreg(lngini_w ~ dism1990 + lenper | herf + lenper, data = df)
+iv_gini_b <- ivreg(lngini_b ~ dism1990 + lenper | herf + lenper, data = df)
+
+# Calculate robust standard errors for IV models
+iv_gini_w_rse <- sqrt(diag(vcovHC(iv_gini_w, type = "HC1")))
+iv_gini_b_rse <- sqrt(diag(vcovHC(iv_gini_b, type = "HC1")))
+
+# OLS models for poverty rates (for comparison in the same table)
+ols_pov_w <- felm(povrate_w ~ dism1990, data = df)
+ols_pov_b <- felm(povrate_b ~ dism1990, data = df)
+
+# IV models for poverty rates (already calculated above, but redeclare for clarity)
+iv_pov_w <- ivreg(povrate_w ~ dism1990 + lenper | herf + lenper, data = df)
+iv_pov_b <- ivreg(povrate_b ~ dism1990 + lenper | herf + lenper, data = df)
+
+# Calculate robust standard errors for poverty IV models
+iv_pov_w_rse <- sqrt(diag(vcovHC(iv_pov_w, type = "HC1")))
+iv_pov_b_rse <- sqrt(diag(vcovHC(iv_pov_b, type = "HC1")))
+
+# Generate comprehensive table (Table 2, Panel 1 replication)
+stargazer(ols_gini_w, iv_gini_w, ols_gini_b, iv_gini_b,
+          ols_pov_w, iv_pov_w, ols_pov_b, iv_pov_b,
+          se = list(ols_gini_w$rse, iv_gini_w_rse,
+                    ols_gini_b$rse, iv_gini_b_rse,
+                    ols_pov_w$rse, iv_pov_w_rse,
+                    ols_pov_b$rse, iv_pov_b_rse),
+          type = "latex",
+          title = "Table 2, Panel 1: Effects of Segregation on Within-Race Inequality and Poverty",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS"),
+          dep.var.labels = c("Log Gini (White)", "Log Gini (White)",
+                           "Log Gini (Black)", "Log Gini (Black)",
+                           "Poverty (White)", "Poverty (White)",
+                           "Poverty (Black)", "Poverty (Black)"),
+          covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
+          header = FALSE,
+          font.size = "small",
+          column.sep.width = "1pt",
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "2SLS models instrument segregation with Railroad Division Index.",
+                   "Columns 1-4: Within-race inequality (Gini); Columns 5-8: Poverty rates"))
+```
+
+**Interpretation of Within-Race Inequality Results:**
+
+**1. White Within-Race Inequality (Log Gini for Whites):**
+
+The 2SLS estimate shows that exogenous increases in segregation **decrease** within-race inequality among whites (negative coefficient on `lngini_w`). This suggests that segregation makes the white population more economically homogeneous, possibly by:
+
+- Concentrating whites in middle-to-upper-class neighborhoods with similar economic profiles
+- Reducing exposure to economic diversity within white communities
+- Creating more uniform access to resources and opportunities among whites
+
+**2. Black Within-Race Inequality (Log Gini for Blacks):**
+
+The 2SLS estimate indicates that segregation affects within-race inequality among blacks differently. The effect suggests that segregation may concentrate poverty within the Black population while also maintaining some economic stratification.
+
+**3. Key Insight: Asymmetric Within-Race Effects**
+
+Segregation has **differential effects on within-group inequality**:
+- For whites: Creates more homogeneous (equal) outcomes within the group
+- For blacks: Different pattern of within-group inequality
+
+**4. Combined Interpretation: Between vs. Within Effects**
+
+The results demonstrate that segregation simultaneously:
+- **Increases between-race inequality** (widens the gap in poverty rates between whites and blacks)
+- **Decreases within-race inequality for whites** (makes white outcomes more uniform)
+- **Affects within-race inequality for blacks differently** (complex distributional effects)
+
+This multi-dimensional impact shows that segregation reshapes the entire income distribution, not just mean outcomes.
+
+### Effects on Between-Race Inequality
+
+While the previous analysis examined within-race inequality, we now turn to **between-race inequality** - how segregation affects income disparities **between** whites and blacks at different points in the income distribution.
+
+**Measurement:** We use log ratios of income percentiles between races:
+- `ln90w90b`: Log of 90th percentile white income to 90th percentile black income (upper-tail inequality)
+- `ln10w10b`: Log of 10th percentile white income to 10th percentile black income (lower-tail inequality)
+- `ln90w10b`: Log of 90th percentile white to 10th percentile black (cross-distribution comparison)
+- `ln90b10w`: Log of 90th percentile black to 10th percentile white (reverse comparison)
+
+```{r between_race_inequality, results='asis'}
+# OLS models for between-race inequality measures
+ols_90w90b <- felm(ln90w90b ~ dism1990, data = df)
+ols_10w10b <- felm(ln10w10b ~ dism1990, data = df)
+ols_90w10b <- felm(ln90w10b ~ dism1990, data = df)
+ols_90b10w <- felm(ln90b10w ~ dism1990, data = df)
+
+# IV/2SLS models for between-race inequality
+iv_90w90b <- ivreg(ln90w90b ~ dism1990 + lenper | herf + lenper, data = df)
+iv_10w10b <- ivreg(ln10w10b ~ dism1990 + lenper | herf + lenper, data = df)
+iv_90w10b <- ivreg(ln90w10b ~ dism1990 + lenper | herf + lenper, data = df)
+iv_90b10w <- ivreg(ln90b10w ~ dism1990 + lenper | herf + lenper, data = df)
+
+# Calculate robust standard errors
+iv_90w90b_rse <- sqrt(diag(vcovHC(iv_90w90b, type = "HC1")))
+iv_10w10b_rse <- sqrt(diag(vcovHC(iv_10w10b, type = "HC1")))
+iv_90w10b_rse <- sqrt(diag(vcovHC(iv_90w10b, type = "HC1")))
+iv_90b10w_rse <- sqrt(diag(vcovHC(iv_90b10w, type = "HC1")))
+
+# Generate Table 2, Panel 2
+stargazer(ols_90w90b, iv_90w90b, ols_10w10b, iv_10w10b,
+          ols_90w10b, iv_90w10b, ols_90b10w, iv_90b10w,
+          se = list(ols_90w90b$rse, iv_90w90b_rse,
+                    ols_10w10b$rse, iv_10w10b_rse,
+                    ols_90w10b$rse, iv_90w10b_rse,
+                    ols_90b10w$rse, iv_90b10w_rse),
+          type = "latex",
+          title = "Table 2, Panel 2: Effects of Segregation on Between-Race Inequality",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS"),
+          dep.var.labels = c("ln(90W/90B)", "ln(90W/90B)",
+                           "ln(10W/10B)", "ln(10W/10B)",
+                           "ln(90W/10B)", "ln(90W/10B)",
+                           "ln(90B/10W)", "ln(90B/10W)"),
+          covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
+          header = FALSE,
+          font.size = "small",
+          column.sep.width = "1pt",
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "2SLS models instrument segregation with Railroad Division Index.",
+                   "W = White, B = Black, numbers indicate income percentiles"))
+```
+
+**Interpretation of Between-Race Inequality Results:**
+
+**1. Upper-Tail Inequality (90th Percentile Comparison - ln90w90b):**
+
+The positive coefficient indicates that segregation **increases** the income gap between high-earning whites and high-earning blacks. Even at the 90th percentile, segregation creates substantial racial disparities, suggesting that:
+- High-earning blacks face barriers that limit income even at the top of their distribution
+- Segregation affects economic outcomes across the entire income distribution, not just for the poor
+
+**2. Lower-Tail Inequality (10th Percentile Comparison - ln10w10b):**
+
+The coefficient on ln10w10b shows how segregation affects the income gap between low-earning whites and low-earning blacks. This reveals whether segregation has differential effects at the bottom of the income distribution.
+
+**3. Cross-Distribution Comparisons (ln90w10b and ln90b10w):**
+
+These measures capture extreme comparisons across the income distribution:
+- **ln90w10b**: Compares wealthy whites to poor blacks - captures the maximum racial advantage
+- **ln90b10w**: Compares wealthy blacks to poor whites - reverses the comparison
+
+**4. Key Insight: Segregation Increases Between-Race Inequality Throughout the Distribution**
+
+The results demonstrate that segregation:
+- Widens racial income gaps at **multiple points** in the income distribution
+- Creates disadvantages for blacks that persist even at higher income levels
+- Has pervasive effects beyond just poverty - affecting the entire economic structure
+
+**5. Combined Understanding: The Full Distributional Impact**
+
+Combining Panels 1 and 2, we see that segregation:
+- **Within whites**: Reduces inequality (homogenizes outcomes)
+- **Within blacks**: Complex effects on inequality
+- **Between races**: Substantially increases inequality at all income levels
+
+This creates a pattern where segregation simultaneously concentrates whites into a more economically uniform (and advantaged) group while maintaining or exacerbating economic stratification for blacks, all while widening the gap between the two groups.
+
+\newpage
+
+## Robustness Check
+
+### Adding Control Variables
+
+To ensure our results are robust, we re-estimate the models while controlling for additional city characteristics that might confound the relationship:
+
+```{r robustness, results='asis'}
+# Remove rows with missing values for the controls we'll use
+df_robust <- df %>%
+  filter(!is.na(pop1990), !is.na(black1910))
+
+# Baseline IV models (no additional controls)
+iv_base_w <- ivreg(povrate_w ~ dism1990 + lenper | herf + lenper, data = df_robust)
+iv_base_b <- ivreg(povrate_b ~ dism1990 + lenper | herf + lenper, data = df_robust)
+
+# Add 1990 population control (log scale to avoid collinearity)
+df_robust <- df_robust %>% mutate(log_pop1990 = log(pop1990 + 1))
+iv_pop_w <- ivreg(povrate_w ~ dism1990 + lenper + log_pop1990 | herf + lenper + log_pop1990,
+                  data = df_robust)
+iv_pop_b <- ivreg(povrate_b ~ dism1990 + lenper + log_pop1990 | herf + lenper + log_pop1990,
+                  data = df_robust)
+
+# Add historical Black population share control
+iv_hist_w <- ivreg(povrate_w ~ dism1990 + lenper + black1910 | herf + lenper + black1910,
+                   data = df_robust)
+iv_hist_b <- ivreg(povrate_b ~ dism1990 + lenper + black1910 | herf + lenper + black1910,
+                   data = df_robust)
+
+# Calculate robust standard errors using coeftest (more stable)
+library(lmtest)
+iv_base_w_coef <- coeftest(iv_base_w, vcov = vcovHC(iv_base_w, type = "HC1"))
+iv_base_b_coef <- coeftest(iv_base_b, vcov = vcovHC(iv_base_b, type = "HC1"))
+iv_pop_w_coef <- coeftest(iv_pop_w, vcov = vcovHC(iv_pop_w, type = "HC1"))
+iv_pop_b_coef <- coeftest(iv_pop_b, vcov = vcovHC(iv_pop_b, type = "HC1"))
+iv_hist_w_coef <- coeftest(iv_hist_w, vcov = vcovHC(iv_hist_w, type = "HC1"))
+iv_hist_b_coef <- coeftest(iv_hist_b, vcov = vcovHC(iv_hist_b, type = "HC1"))
+
+# Extract standard errors
+iv_base_w_rse <- iv_base_w_coef[, "Std. Error"]
+iv_base_b_rse <- iv_base_b_coef[, "Std. Error"]
+iv_pop_w_rse <- iv_pop_w_coef[, "Std. Error"]
+iv_pop_b_rse <- iv_pop_b_coef[, "Std. Error"]
+iv_hist_w_rse <- iv_hist_w_coef[, "Std. Error"]
+iv_hist_b_rse <- iv_hist_b_coef[, "Std. Error"]
+
+# Generate robustness table
+stargazer(iv_base_w, iv_pop_w, iv_hist_w,
+          iv_base_b, iv_pop_b, iv_hist_b,
+          se = list(iv_base_w_rse, iv_pop_w_rse, iv_hist_w_rse,
+                    iv_base_b_rse, iv_pop_b_rse, iv_hist_b_rse),
+          type = "latex",
+          title = "Robustness: Controlling for Additional City Characteristics",
+          column.labels = rep(c("Baseline", "+Log(Pop)", "+\\% Black 1910"), 2),
+          dep.var.labels = c("White Poverty", "Black Poverty"),
+          covariate.labels = c("Dissimilarity Index", "Track Length",
+                              "Log(Population 1990)", "\\% Black 1910"),
+          header = FALSE,
+          omit.stat = c("ser"),
+          font.size = "small",
+          column.sep.width = "2pt",
+          digits = 3,
+          notes = "All models use 2SLS with RDI as instrument. Robust standard errors.")
+```
+
+**Interpretation:**
+
+The coefficient on segregation (dissimilarity index) remains **remarkably stable** across all specifications:
+
+- For white poverty: All three estimates are negative and similar in magnitude
+- For Black poverty: All three estimates are positive and similar in magnitude
+
+All estimates remain **statistically significant** and the magnitudes are within the confidence intervals of the baseline model. This provides strong evidence that:
+
+1. Our results are not driven by confounding from city size or historical racial composition
+2. The causal interpretation is robust to alternative specifications
+3. The Railroad Division Index is capturing exogenous variation in segregation
+
+\newpage
+
+# Re-analysis of the Main Results
+
+## Inverse Probability Weighting (IPW)
+
+### Assumptions
+
+While the original paper uses instrumental variables to address endogeneity, we can complement this analysis using **Inverse Probability Weighting (IPW)**, a method from the treatment effects literature. This approach:
+
+1. Creates a pseudo-population where treatment (high segregation) is independent of confounders
+2. Provides an alternative identification strategy to validate the main results
+3. Demonstrates robustness using a different causal inference framework
+
+We define treatment as having above-median segregation and estimate propensity scores based on observable city characteristics.
+
+**Key Assumptions:**
+
+1. **Conditional Independence (Unconfoundedness)**: Conditional on observed covariates (track length, population, percent Black), the treatment assignment (high segregation) is independent of potential outcomes.
+
+2. **Common Support**: For each value of the covariates, there is a positive probability of receiving both treatment and control (i.e., both high and low segregation are possible).
+
+3. **Positivity**: All units have a non-zero probability of receiving each treatment level, given the covariates.
+
+### Results
+
+#### Step 1: Define Treatment and Estimate Propensity Scores
+
+```{r ipw_setup}
+# Create binary treatment: above-median segregation
+df <- df %>%
+  mutate(high_segregation = as.numeric(dism1990 > median(dism1990, na.rm = TRUE)))
+
+# Estimate propensity scores using logistic regression
+propensity_model <- glm(
+  high_segregation ~ lenper + pop1990 + pctbk1990,
+  family = binomial(link = "logit"),
+  data = df
+)
+
+# Calculate propensity scores
+df$prop_score <- predict(propensity_model, type = "response")
+
+# Calculate IPW weights
+df$ipw_weight <- ifelse(
+  df$high_segregation == 1,
+  1 / df$prop_score,                    # Treated units
+  1 / (1 - df$prop_score)               # Control units
+)
+
+# Check weight distribution
+cat("IPW Weight Summary:\n")
+summary(df$ipw_weight)
+```
+
+#### Step 2: Examine Propensity Score Distribution
+
+```{r propensity_plot, fig.width=5.5, fig.height=3.5, out.width="85%", fig.align='center'}
+# Visualize propensity score overlap
+ggplot(df, aes(x = prop_score, fill = factor(high_segregation))) +
+  geom_density(alpha = 0.6) +
+  scale_fill_manual(
+    values = c("0" = "cornflowerblue", "1" = "firebrick"),
+    labels = c("Low Seg.", "High Seg.")
+  ) +
+  labs(
+    title = "Propensity Score Distribution",
+    x = "Propensity Score",
+    y = "Density",
+    fill = ""
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 10),
+    axis.title = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom",
+    legend.text = element_text(size = 8),
+    legend.key.size = unit(0.4, "cm"),
+    plot.margin = margin(2, 2, 2, 2, "pt")
+  )
+```
+
+Good overlap in propensity scores suggests we have common support for treatment and control groups.
+
+#### Step 3: IPW-Weighted Regression
+
+```{r ipw_regression, results='asis'}
+# IPW-weighted OLS regressions
+ipw_w <- lm(povrate_w ~ dism1990, weights = ipw_weight, data = df)
+ipw_b <- lm(povrate_b ~ dism1990, weights = ipw_weight, data = df)
+
+# For comparison, also show unweighted OLS
+ols_w_comp <- lm(povrate_w ~ dism1990, data = df)
+ols_b_comp <- lm(povrate_b ~ dism1990, data = df)
+
+# Calculate robust standard errors
+ipw_w_se <- sqrt(diag(vcovHC(ipw_w, type = "HC1")))
+ipw_b_se <- sqrt(diag(vcovHC(ipw_b, type = "HC1")))
+
+# Display results
+stargazer(ols_w_comp, ipw_w, ols_b_comp, ipw_b,
+          se = list(NULL, ipw_w_se, NULL, ipw_b_se),
+          type = "latex",
+          title = "IPW Estimates: Effect of Segregation on Poverty Rates",
+          column.labels = c("OLS", "IPW", "OLS", "IPW"),
+          dep.var.labels = c("White Poverty", "Black Poverty"),
+          covariate.labels = "Dissimilarity Index",
+          header = FALSE,
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "IPW weights balance treatment based on track length, population, and \\% Black."))
+```
+
+#### Step 4: Combining IPW with IV (2SLS-IPW)
+
+We can also combine both approaches by using IPW weights in the instrumental variables regression:
+
+```{r ipw_iv, results='asis'}
+# IPW-weighted IV regression
+ipw_iv_w <- ivreg(povrate_w ~ dism1990 | herf,
+                  weights = ipw_weight,
+                  data = df)
+
+ipw_iv_b <- ivreg(povrate_b ~ dism1990 | herf,
+                  weights = ipw_weight,
+                  data = df)
+
+# Calculate robust standard errors
+ipw_iv_w_se <- sqrt(diag(vcovHC(ipw_iv_w, type = "HC1")))
+ipw_iv_b_se <- sqrt(diag(vcovHC(ipw_iv_b, type = "HC1")))
+
+# Compare with baseline IV
+stargazer(iv_w, ipw_iv_w, iv_b, ipw_iv_b,
+          se = list(iv_w$rse, ipw_iv_w_se, iv_b$rse, ipw_iv_b_se),
+          type = "latex",
+          title = "Comparison: Standard 2SLS vs. IPW-Weighted 2SLS",
+          column.labels = c("2SLS", "2SLS+IPW", "2SLS", "2SLS+IPW"),
+          dep.var.labels = c("White Poverty", "Black Poverty"),
+          covariate.labels = c("Dissimilarity Index", "Track Length"),
+          header = FALSE,
+          digits = 3,
+          notes = "All models use Railroad Division Index as instrument")
+```
+
+#### Comparison of Methods
+
+```{r comparison_table}
+# Create comparison table
+comparison_df <- data.frame(
+  Method = c("OLS", "2SLS (IV)", "IPW", "2SLS + IPW"),
+  White_Poverty = c(
+    round(coef(ols_w_comp)["dism1990"], 3),
+    round(coef(iv_w)["dism1990"], 3),
+    round(coef(ipw_w)["dism1990"], 3),
+    round(coef(ipw_iv_w)["dism1990"], 3)
+  ),
+  Black_Poverty = c(
+    round(coef(ols_b_comp)["dism1990"], 3),
+    round(coef(iv_b)["dism1990"], 3),
+    round(coef(ipw_b)["dism1990"], 3),
+    round(coef(ipw_iv_b)["dism1990"], 3)
+  )
+)
+
+kable(comparison_df,
+      format = "latex",
+      booktabs = TRUE,
+      col.names = c("Method", "White Poverty", "Black Poverty"),
+      caption = "Comparison of Effect Estimates Across Methods") %>%
+  kable_styling(latex_options = c("striped", "hold_position"))
+```
+
+**Interpretation:**
+
+1. **IPW estimates** are generally similar to OLS, suggesting that observed confounders explain some but not all of the bias
+
+2. **2SLS estimates** are larger in magnitude, indicating that addressing endogeneity through instrumental variables is crucial
+
+3. **2SLS+IPW combined approach** yields estimates that are close to the standard 2SLS, providing additional confidence in the causal estimates
+
+4. All methods show the **same qualitative pattern**: segregation decreases white poverty and increases Black poverty
+
+The consistency across methods strengthens confidence in the causal interpretation of the main findings.
+
+\newpage
