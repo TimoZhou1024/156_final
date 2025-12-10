@@ -1,5 +1,4 @@
 .claude/
-test_files/
+*_files/
 *.html
 *.log
-test_new_files/
