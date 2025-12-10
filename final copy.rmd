@@ -776,52 +776,62 @@ Beyond poverty rates, we examine how segregation affects **within-race income in
 **Measurement:** We use log Gini coefficients for whites (`lngini_w`) and blacks (`lngini_b`) as measures of income inequality within each racial group. Higher values indicate greater within-group inequality.
 
 ```{r within_race_inequality, results='asis'}
-# OLS models for Gini coefficients (for comparison)
-ols_gini_w <- felm(lngini_w ~ dism1990, data = df)
-ols_gini_b <- felm(lngini_b ~ dism1990, data = df)
+# OLS models for Gini coefficients using lm() for consistency
+ols_gini_w <- lm(lngini_w ~ dism1990, data = df)
+ols_gini_b <- lm(lngini_b ~ dism1990, data = df)
 
 # IV/2SLS models for Gini coefficients
 iv_gini_w <- ivreg(lngini_w ~ dism1990 + lenper | herf + lenper, data = df)
 iv_gini_b <- ivreg(lngini_b ~ dism1990 + lenper | herf + lenper, data = df)
 
-# Calculate robust standard errors for IV models
-iv_gini_w_rse <- sqrt(diag(vcovHC(iv_gini_w, type = "HC1")))
-iv_gini_b_rse <- sqrt(diag(vcovHC(iv_gini_b, type = "HC1")))
+# OLS models for poverty rates using lm() for consistency
+ols_pov_w <- lm(povrate_w ~ dism1990, data = df)
+ols_pov_b <- lm(povrate_b ~ dism1990, data = df)
 
-# OLS models for poverty rates (for comparison in the same table)
-ols_pov_w <- felm(povrate_w ~ dism1990, data = df)
-ols_pov_b <- felm(povrate_b ~ dism1990, data = df)
-
-# IV models for poverty rates (already calculated above, but redeclare for clarity)
+# IV models for poverty rates
 iv_pov_w <- ivreg(povrate_w ~ dism1990 + lenper | herf + lenper, data = df)
 iv_pov_b <- ivreg(povrate_b ~ dism1990 + lenper | herf + lenper, data = df)
 
-# Calculate robust standard errors for poverty IV models
+# Calculate robust standard errors for all models
+ols_gini_w_rse <- sqrt(diag(vcovHC(ols_gini_w, type = "HC1")))
+ols_gini_b_rse <- sqrt(diag(vcovHC(ols_gini_b, type = "HC1")))
+ols_pov_w_rse <- sqrt(diag(vcovHC(ols_pov_w, type = "HC1")))
+ols_pov_b_rse <- sqrt(diag(vcovHC(ols_pov_b, type = "HC1")))
+
+iv_gini_w_rse <- sqrt(diag(vcovHC(iv_gini_w, type = "HC1")))
+iv_gini_b_rse <- sqrt(diag(vcovHC(iv_gini_b, type = "HC1")))
 iv_pov_w_rse <- sqrt(diag(vcovHC(iv_pov_w, type = "HC1")))
 iv_pov_b_rse <- sqrt(diag(vcovHC(iv_pov_b, type = "HC1")))
 
-# Generate comprehensive table (Table 2, Panel 1 replication)
+# Generate table for Gini coefficients (within-race inequality)
 stargazer(ols_gini_w, iv_gini_w, ols_gini_b, iv_gini_b,
-          ols_pov_w, iv_pov_w, ols_pov_b, iv_pov_b,
-          se = list(ols_gini_w$rse, iv_gini_w_rse,
-                    ols_gini_b$rse, iv_gini_b_rse,
-                    ols_pov_w$rse, iv_pov_w_rse,
-                    ols_pov_b$rse, iv_pov_b_rse),
+          se = list(ols_gini_w_rse, iv_gini_w_rse,
+                    ols_gini_b_rse, iv_gini_b_rse),
           type = "latex",
-          title = "Table 2, Panel 1: Effects of Segregation on Within-Race Inequality and Poverty",
-          column.labels = c("OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS"),
+          title = "Table 2, Panel 1A: Effects of Segregation on Within-Race Inequality (Gini Coefficients)",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS"),
           dep.var.labels = c("Log Gini (White)", "Log Gini (White)",
-                           "Log Gini (Black)", "Log Gini (Black)",
-                           "Poverty (White)", "Poverty (White)",
+                           "Log Gini (Black)", "Log Gini (Black)"),
+          covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
+          header = FALSE,
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "2SLS models instrument segregation with Railroad Division Index."))
+
+# Generate table for poverty rates
+stargazer(ols_pov_w, iv_pov_w, ols_pov_b, iv_pov_b,
+          se = list(ols_pov_w_rse, iv_pov_w_rse,
+                    ols_pov_b_rse, iv_pov_b_rse),
+          type = "latex",
+          title = "Table 2, Panel 1B: Effects of Segregation on Poverty Rates",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS"),
+          dep.var.labels = c("Poverty (White)", "Poverty (White)",
                            "Poverty (Black)", "Poverty (Black)"),
           covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
           header = FALSE,
-          font.size = "small",
-          column.sep.width = "1pt",
           digits = 3,
           notes = c("Robust standard errors in parentheses.",
-                   "2SLS models instrument segregation with Railroad Division Index.",
-                   "Columns 1-4: Within-race inequality (Gini); Columns 5-8: Poverty rates"))
+                   "2SLS models instrument segregation with Railroad Division Index."))
 ```
 
 **Interpretation of Within-Race Inequality Results:**
@@ -864,11 +874,11 @@ While the previous analysis examined within-race inequality, we now turn to **be
 - `ln90b10w`: Log of 90th percentile black to 10th percentile white (reverse comparison)
 
 ```{r between_race_inequality, results='asis'}
-# OLS models for between-race inequality measures
-ols_90w90b <- felm(ln90w90b ~ dism1990, data = df)
-ols_10w10b <- felm(ln10w10b ~ dism1990, data = df)
-ols_90w10b <- felm(ln90w10b ~ dism1990, data = df)
-ols_90b10w <- felm(ln90b10w ~ dism1990, data = df)
+# OLS models for between-race inequality measures using lm() for consistency
+ols_90w90b <- lm(ln90w90b ~ dism1990, data = df)
+ols_10w10b <- lm(ln10w10b ~ dism1990, data = df)
+ols_90w10b <- lm(ln90w10b ~ dism1990, data = df)
+ols_90b10w <- lm(ln90b10w ~ dism1990, data = df)
 
 # IV/2SLS models for between-race inequality
 iv_90w90b <- ivreg(ln90w90b ~ dism1990 + lenper | herf + lenper, data = df)
@@ -876,30 +886,44 @@ iv_10w10b <- ivreg(ln10w10b ~ dism1990 + lenper | herf + lenper, data = df)
 iv_90w10b <- ivreg(ln90w10b ~ dism1990 + lenper | herf + lenper, data = df)
 iv_90b10w <- ivreg(ln90b10w ~ dism1990 + lenper | herf + lenper, data = df)
 
-# Calculate robust standard errors
+# Calculate robust standard errors for all models
+ols_90w90b_rse <- sqrt(diag(vcovHC(ols_90w90b, type = "HC1")))
+ols_10w10b_rse <- sqrt(diag(vcovHC(ols_10w10b, type = "HC1")))
+ols_90w10b_rse <- sqrt(diag(vcovHC(ols_90w10b, type = "HC1")))
+ols_90b10w_rse <- sqrt(diag(vcovHC(ols_90b10w, type = "HC1")))
+
 iv_90w90b_rse <- sqrt(diag(vcovHC(iv_90w90b, type = "HC1")))
 iv_10w10b_rse <- sqrt(diag(vcovHC(iv_10w10b, type = "HC1")))
 iv_90w10b_rse <- sqrt(diag(vcovHC(iv_90w10b, type = "HC1")))
 iv_90b10w_rse <- sqrt(diag(vcovHC(iv_90b10w, type = "HC1")))
 
-# Generate Table 2, Panel 2
+# Generate Table 2, Panel 2A: Same-percentile comparisons
 stargazer(ols_90w90b, iv_90w90b, ols_10w10b, iv_10w10b,
-          ols_90w10b, iv_90w10b, ols_90b10w, iv_90b10w,
-          se = list(ols_90w90b$rse, iv_90w90b_rse,
-                    ols_10w10b$rse, iv_10w10b_rse,
-                    ols_90w10b$rse, iv_90w10b_rse,
-                    ols_90b10w$rse, iv_90b10w_rse),
+          se = list(ols_90w90b_rse, iv_90w90b_rse,
+                    ols_10w10b_rse, iv_10w10b_rse),
           type = "latex",
-          title = "Table 2, Panel 2: Effects of Segregation on Between-Race Inequality",
-          column.labels = c("OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS", "OLS", "2SLS"),
+          title = "Table 2, Panel 2A: Between-Race Inequality at Same Percentiles",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS"),
           dep.var.labels = c("ln(90W/90B)", "ln(90W/90B)",
-                           "ln(10W/10B)", "ln(10W/10B)",
-                           "ln(90W/10B)", "ln(90W/10B)",
+                           "ln(10W/10B)", "ln(10W/10B)"),
+          covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
+          header = FALSE,
+          digits = 3,
+          notes = c("Robust standard errors in parentheses.",
+                   "2SLS models instrument segregation with Railroad Division Index.",
+                   "W = White, B = Black, numbers indicate income percentiles"))
+
+# Generate Table 2, Panel 2B: Cross-distribution comparisons
+stargazer(ols_90w10b, iv_90w10b, ols_90b10w, iv_90b10w,
+          se = list(ols_90w10b_rse, iv_90w10b_rse,
+                    ols_90b10w_rse, iv_90b10w_rse),
+          type = "latex",
+          title = "Table 2, Panel 2B: Between-Race Inequality Cross-Distribution",
+          column.labels = c("OLS", "2SLS", "OLS", "2SLS"),
+          dep.var.labels = c("ln(90W/10B)", "ln(90W/10B)",
                            "ln(90B/10W)", "ln(90B/10W)"),
           covariate.labels = c("Dissimilarity Index", "Track Length per sq km"),
           header = FALSE,
-          font.size = "small",
-          column.sep.width = "1pt",
           digits = 3,
           notes = c("Robust standard errors in parentheses.",
                    "2SLS models instrument segregation with Railroad Division Index.",
